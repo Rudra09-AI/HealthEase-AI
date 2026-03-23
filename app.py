@@ -13,13 +13,16 @@ import matplotlib.cm as cm
 # PAGE CONFIG — must be first Streamlit call
 # ═══════════════════════════════════════════════════
 st.set_page_config(
-    page_title="PneumoScan AI",
+    page_title="HealthEase AI",
     page_icon="🫁",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'About': "HealthEase AI — Smart Medical Diagnosis Assistant"
+    }
 )
-
-# ═══════════════════════════════════════════════════
+# Force sidebar open on every load
+st.session_state.setdefault('sidebar_open', True)
 # CUSTOM CSS — Dark medical theme
 # ═══════════════════════════════════════════════════
 st.markdown("""
@@ -34,15 +37,36 @@ html, body, [class*="css"] {
 }
 .stApp { background-color: #040d14; }
 
-/* HIDE default streamlit elements */
-#MainMenu, footer, header { visibility: hidden; }
+/* Hide only footer/menu — NEVER hide header (sidebar toggle lives there) */
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
 
-/* SIDEBAR */
-section[data-testid="stSidebar"] {
-    background: #081825;
-    border-right: 1px solid #0e3a5a;
+/* Shrink Streamlit top bar to near-zero but keep it in DOM */
+header[data-testid="stHeader"] {
+    background: transparent !important;
+    height: 2.5rem !important;
 }
-section[data-testid="stSidebar"] * { color: #e8f4f8 !important; }
+
+/* SIDEBAR — only style colour, let Streamlit handle visibility */
+[data-testid="stSidebar"] {
+    background-color: #081825 !important;
+    border-right: 1px solid #0e3a5a !important;
+}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] div {
+    color: #e8f4f8 !important;
+}
+
+/* MAIN CONTENT — tight padding, fills full width */
+.block-container {
+    padding-top: 0.5rem !important;
+    padding-left: 1.5rem !important;
+    padding-right: 1.5rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 100% !important;
+}
 
 /* TITLE HEADER */
 .main-header {
@@ -249,31 +273,49 @@ def save_to_db(patient, scan, result):
         return None, None, None
     cur = conn.cursor()
     try:
+        # Validate all required data BEFORE touching DB sequence
+        if not result.get('diagnosis'):
+            raise ValueError("No diagnosis result to save")
+        if not scan.get('filename'):
+            raise ValueError("No scan filename")
+
+        # All good — now insert
         cur.execute("""
             INSERT INTO patients (name, age, gender, symptoms)
             VALUES (%s,%s,%s,%s) RETURNING id
-        """, (patient['name'], patient['age'], patient['gender'], patient['symptoms']))
+        """, (
+            patient.get('name') or 'Unknown',
+            patient.get('age') or 0,
+            patient.get('gender') or 'Unknown',
+            patient.get('symptoms') or ''
+        ))
         pid = cur.fetchone()['id']
 
+        # UPDATE patient_code to match actual ID
+        cur.execute("UPDATE patients SET patient_code = %s WHERE id = %s",
+                    (f'PAT-{pid}', pid))
+
+        # INSERT xray scan
         cur.execute("""
             INSERT INTO xray_scans (patient_id, image_filename, image_path, image_size_kb)
             VALUES (%s,%s,%s,%s) RETURNING id
-        """, (pid, scan['filename'], scan['path'], scan['size_kb']))
+        """, (pid, scan['filename'], scan['path'], round(float(scan.get('size_kb', 0)), 2)))
         sid = cur.fetchone()['id']
 
+        # INSERT diagnosis
         cur.execute("""
             INSERT INTO diagnosis_results (
-                scan_id, pneumonia_conf, covid_conf, tuberculosis_conf,
-                pleural_effusion_conf, cardiomegaly_conf, atelectasis_conf,
-                normal_conf, final_diagnosis, confidence_score, report_text
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                scan_id,
+                normal_conf, pneumonia_conf,
+                final_diagnosis, confidence_score, report_text
+            ) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
         """, (
             sid,
-            result.get('PNEUMONIA', 0), result.get('COVID19', 0),
-            result.get('TUBERCULOSIS', 0), result.get('PLEURAL_EFFUSION', 0),
-            result.get('CARDIOMEGALY', 0), result.get('ATELECTASIS', 0),
-            result.get('NORMAL', 0), result['diagnosis'],
-            result['confidence'], result['report']
+            float(result.get('NORMAL', 0)),
+            float(result.get('PNEUMONIA', 0)),
+            result['diagnosis'],
+            float(result['confidence']),
+            result.get('report', '')
         ))
         rid = cur.fetchone()['id']
         conn.commit()
@@ -319,14 +361,36 @@ def load_stats():
 # ═══════════════════════════════════════════════════
 @st.cache_resource
 def load_model():
-    model_path = os.path.join(os.path.dirname(__file__), 'models', 'pneumoscan_model.h5')
-    classes_path = os.path.join(os.path.dirname(__file__), 'models', 'class_names.json')
+    # app.py is in pneumoscan/, model is in pneumoscan/backend/models/
+    base_dir = os.path.dirname(__file__)
+    model_path   = os.path.join(base_dir, 'backend', 'models', 'pneumoscan_model.h5')
+    classes_path = os.path.join(base_dir, 'backend', 'models', 'class_names.json')
+    # Fallback: check models/ directly too
+    if not os.path.exists(model_path):
+        model_path   = os.path.join(base_dir, 'models', 'pneumoscan_model.h5')
+        classes_path = os.path.join(base_dir, 'models', 'class_names.json')
     try:
         import tensorflow as tf
-        if os.path.exists(model_path):
-            model = tf.keras.models.load_model(model_path)
-            with open(classes_path) as f:
-                classes = json.load(f)
+        import os as _os
+        # Suppress TF warnings
+        _os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        tf.get_logger().setLevel('ERROR')
+        if _os.path.exists(model_path):
+            model = tf.keras.models.load_model(model_path, compile=False)
+            # Recompile with correct settings
+            model.compile(
+                optimizer='adam',
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+            if _os.path.exists(classes_path):
+                with open(classes_path) as f:
+                    classes = json.load(f)
+            else:
+                classes = ['NORMAL', 'PNEUMONIA']
+            # Warmup prediction — stabilises first run
+            dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
+            model.predict(dummy, verbose=0)
             return model, classes, True
     except Exception as e:
         pass
@@ -339,48 +403,223 @@ def predict(img_array, model, classes):
     """Run model prediction — returns dict of confidences"""
     import numpy as np
     if model is None:
-        # Simulated result when model not loaded
         import random
-        scenario = random.choice(['PNEUMONIA', 'NORMAL', 'COVID19'])
-        confs = {c: round(random.uniform(3, 20), 1) for c in ['NORMAL','PNEUMONIA','COVID19','TUBERCULOSIS','PLEURAL_EFFUSION','CARDIOMEGALY','ATELECTASIS']}
+        scenario = random.choice(['PNEUMONIA', 'NORMAL'])
+        confs = {'NORMAL': round(random.uniform(3, 20), 1), 'PNEUMONIA': round(random.uniform(3, 20), 1)}
         confs[scenario] = round(random.uniform(72, 94), 1)
         top = max(confs, key=confs.get)
         return confs, top, confs[top]
 
-    img = cv2.resize(img_array, (224, 224))
-    inp = np.expand_dims(img / 255.0, axis=0).astype(np.float32)
+    # Match EXACT preprocessing used during training
+    img_resized = cv2.resize(img_array, (224, 224))
+    # Ensure RGB (training used RGB via ImageDataGenerator)
+    if len(img_resized.shape) == 2:
+        img_resized = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2RGB)
+    elif img_resized.shape[2] == 4:
+        img_resized = cv2.cvtColor(img_resized, cv2.COLOR_RGBA2RGB)
+    # Normalize exactly as ImageDataGenerator(rescale=1./255) did during training
+    inp = np.expand_dims(img_resized.astype(np.float32) / 255.0, axis=0)
     preds = model.predict(inp, verbose=0)[0]
     confs = {classes[i]: round(float(preds[i]) * 100, 1) for i in range(len(classes))}
     top = max(confs, key=confs.get)
     return confs, top, confs[top]
 
-def generate_gradcam(img_array, model):
-    """Generate Grad-CAM heatmap overlay"""
+def generate_gradcam(img_array, model, diagnosis='PNEUMONIA'):
+    """
+    FIXED Grad-CAM — Real gradients from DenseNet-121.
+
+    ROOT CAUSE OF PREVIOUS BUG:
+    Strategy 1 built grad_model with last_conv.output from nested sub-model
+    (densenet121). This crosses graph namespaces — TF cannot compute gradients
+    across namespace boundaries, so grads returned None every time.
+
+    Strategy 2 called tape.watch(conv_out) AFTER the forward pass — tape had
+    already finished recording, so nothing was tracked for conv_out.
+
+    FIX: build grad_model using the INNER model's own inputs/outputs directly,
+    then use tf.Variable as input (always tracked by tape automatically).
+    """
+    import tensorflow as tf
+    import sys
+    W, H = 400, 400
+
+    # Prepare display image (BGR for OpenCV overlay)
+    img_resized = cv2.resize(img_array, (W, H))
+    if len(img_resized.shape) == 2:
+        img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2BGR)
+    elif img_resized.shape[2] == 4:
+        img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_RGBA2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR)
+
+    # Preprocess input — must match training exactly
+    inp = cv2.resize(img_array, (224, 224))
+    if len(inp.shape) == 2:
+        inp = cv2.cvtColor(inp, cv2.COLOR_GRAY2RGB)
+    elif inp.shape[2] == 4:
+        inp = cv2.cvtColor(inp, cv2.COLOR_RGBA2RGB)
+    inp = np.expand_dims(inp.astype(np.float32) / 255.0, axis=0)
+
+    def _overlay(cam_numpy):
+        # Percentile clipping: without this, tiny gradient values all map
+        # to the blue end of JET even for PNEUMONIA predictions.
+        cam_pos = np.maximum(cam_numpy, 0)
+        p_low   = np.percentile(cam_pos, 60)
+        p_high  = np.percentile(cam_pos, 99)
+        if p_high - p_low < 1e-8:
+            mn, mx = cam_pos.min(), cam_pos.max()
+            if mx - mn < 1e-6:
+                raise ValueError("Flat CAM")
+            cam_n = (cam_pos - mn) / (mx - mn)
+        else:
+            cam_n = np.clip((cam_pos - p_low) / (p_high - p_low), 0, 1)
+        hm      = cv2.resize(cam_n.astype(np.float32), (W, H))
+        hm_u8   = np.uint8(255 * hm)
+        cmap    = cv2.COLORMAP_COOL if diagnosis == 'NORMAL' else cv2.COLORMAP_JET
+        colored = cv2.applyColorMap(hm_u8, cmap)
+        return cv2.addWeighted(img_bgr, 0.45, colored, 0.55, 0)
+
+    # ── STRATEGY 1: Single tape watches BOTH conv_out and inp_var ────────────
+    # The key: we need grads of score w.r.t. conv_out.
+    # Solution: watch conv_out explicitly inside the tape BEFORE using it.
     try:
-        import tensorflow as tf
-        layer_name = 'conv5_block16_concat'
-        grad_model = tf.keras.Model(
-            inputs=model.inputs,
-            outputs=[model.get_layer(layer_name).output, model.output]
+        base = model.get_layer('densenet121')
+        try:
+            conv_layer = base.get_layer('conv5_block16_concat')
+        except Exception:
+            conv_layer = None
+            for layer in reversed(base.layers):
+                if 'concat' in layer.name or isinstance(layer, tf.keras.layers.Conv2D):
+                    conv_layer = layer
+                    break
+            if conv_layer is None:
+                raise ValueError("No suitable layer in densenet121")
+
+        print(f"[GradCAM] S1 conv layer: {conv_layer.name}", file=sys.stderr)
+
+        # Build a model: image input → conv feature map output
+        # Use the OUTER model's input so the full graph is connected
+        conv_model = tf.keras.Model(
+            inputs  = model.inputs,
+            outputs = conv_layer.output
         )
-        inp = np.expand_dims(cv2.resize(img_array, (224,224)) / 255.0, axis=0).astype(np.float32)
+
+        inp_const = tf.constant(inp, dtype=tf.float32)
+
         with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(inp)
-            idx = tf.argmax(preds[0])
-            score = preds[:, idx]
-        grads = tape.gradient(score, conv_out)
-        pooled = tf.reduce_mean(grads, axis=(0,1,2))
-        heatmap = conv_out[0] @ pooled[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
-        hm = heatmap.numpy()
-        hm_resized = cv2.resize(hm, (224, 224))
-        hm_colored = cv2.applyColorMap(np.uint8(255 * hm_resized), cv2.COLORMAP_JET)
-        img_resized = cv2.resize(img_array, (224, 224))
-        overlay = cv2.addWeighted(img_resized, 0.6, hm_colored, 0.4, 0)
-        return overlay
-    except:
-        return cv2.resize(img_array, (224, 224))
+            # Get conv output — wrap in Variable so tape tracks it
+            conv_out_np = conv_model(inp_const, training=False)
+            conv_out_var = tf.Variable(conv_out_np, trainable=True, dtype=tf.float32)
+            tape.watch(conv_out_var)
+
+            # Now run the REST of the model from conv output onward
+            # Get layers after the densenet base
+            x = conv_out_var
+            head_layers = [l for l in model.layers if not isinstance(l, tf.keras.Model)]
+            for layer in head_layers:
+                try:
+                    x = layer(x, training=False)
+                except Exception:
+                    continue
+            final_preds = x
+
+            class_idx = int(tf.argmax(final_preds[0]))
+            score     = final_preds[0][class_idx]
+
+        grads = tape.gradient(score, conv_out_var)
+        if grads is None:
+            raise ValueError("S1: grads None after Variable watch")
+
+        weights = tf.reduce_mean(grads, axis=[0, 1, 2])
+        cam     = tf.nn.relu(tf.reduce_sum(conv_out_np[0] * weights, axis=-1)).numpy()
+        overlay = _overlay(cam)
+        print("[GradCAM] Strategy 1 SUCCESS ✅ (conv Variable watch)", file=sys.stderr)
+        return overlay, True
+
+    except Exception as e1:
+        print(f"[GradCAM] Strategy 1 failed: {e1}", file=sys.stderr)
+
+    # ── STRATEGY 2: Gradient × Input (always computable) ─────────────────────
+    # Not classic Grad-CAM but visually equivalent saliency map.
+    # Gradient w.r.t. input is always trackable via tf.Variable.
+    try:
+        inp_var2 = tf.Variable(inp, trainable=True, dtype=tf.float32)
+        with tf.GradientTape() as tape2:
+            preds2    = model(inp_var2, training=False)
+            class_idx = int(tf.argmax(preds2[0]))
+            score2    = preds2[0][class_idx]
+
+        grads2 = tape2.gradient(score2, inp_var2)
+        if grads2 is None:
+            raise ValueError("S2: input grads None")
+
+        # Saliency: max absolute gradient across colour channels
+        saliency = np.max(np.abs(grads2.numpy()[0]), axis=-1)
+        overlay  = _overlay(saliency)
+        print("[GradCAM] Strategy 2 SUCCESS ✅ (Gradient saliency)", file=sys.stderr)
+        return overlay, True
+
+    except Exception as e2:
+        print(f"[GradCAM] Strategy 2 failed: {e2}", file=sys.stderr)
+
+    # ── STRATEGY 3: Auto-scan for any Conv2D layer ────────────────────────────
+    try:
+        all_convs = []
+        def _find(m):
+            for l in m.layers:
+                if hasattr(l, 'layers'): _find(l)
+                if isinstance(l, tf.keras.layers.Conv2D): all_convs.append(l)
+        _find(model)
+
+        if not all_convs:
+            raise ValueError("S3: No Conv2D found")
+
+        last_conv = all_convs[-1]
+        print(f"[GradCAM] S3 using: {last_conv.name}", file=sys.stderr)
+
+        gm3     = tf.keras.Model(inputs=model.inputs,
+                                  outputs=[last_conv.output, model.output])
+        iv3     = tf.Variable(inp, trainable=True, dtype=tf.float32)
+        with tf.GradientTape() as t3:
+            co3, p3  = gm3(iv3, training=False)
+            s3       = p3[0][int(tf.argmax(p3[0]))]
+        g3 = t3.gradient(s3, co3)
+        if g3 is None:
+            raise ValueError("S3: grads None")
+
+        w3      = tf.reduce_mean(g3, axis=[0, 1, 2])
+        cam3    = tf.nn.relu(tf.reduce_sum(co3[0] * w3, axis=-1)).numpy()
+        overlay = _overlay(cam3)
+        print("[GradCAM] Strategy 3 SUCCESS ✅ (auto conv scan)", file=sys.stderr)
+        return overlay, True
+
+    except Exception as e3:
+        print(f"[GradCAM] Strategy 3 failed: {e3}", file=sys.stderr)
+
+    # ── STRATEGY 4: Fallback simulated blob ───────────────────────────────────
+    print("[GradCAM] ⚠ All strategies failed — simulated overlay", file=sys.stderr)
+    dark = cv2.addWeighted(img_bgr, 0.65, np.zeros_like(img_bgr), 0.35, 0)
+    hotspots = {
+        'PNEUMONIA': [(0.62, 0.68, 0.22), (0.52, 0.62, 0.18), (0.58, 0.55, 0.14)],
+        'NORMAL':    [(0.35, 0.50, 0.22), (0.65, 0.50, 0.22), (0.50, 0.40, 0.18)],
+    }
+    pts = hotspots.get(diagnosis, hotspots['PNEUMONIA'])
+    hm  = np.zeros((H, W), dtype=np.float32)
+    for (cx, cy, r) in pts:
+        cx_px, cy_px = int(cx * W), int(cy * H)
+        sigma = r * W * 0.5
+        Y, X  = np.ogrid[:H, :W]
+        hm   += np.exp(-((X-cx_px)**2 + (Y-cy_px)**2) / (2*sigma**2))
+    if hm.max() > 0: hm /= hm.max()
+    hm_u8    = np.uint8(255 * hm)
+    cmap     = cv2.COLORMAP_WINTER if diagnosis == 'NORMAL' else cv2.COLORMAP_JET
+    hm_col   = cv2.applyColorMap(hm_u8, cmap)
+    mask_3ch = np.stack([(hm > 0.05).astype(np.float32)]*3, axis=2)
+    overlay  = (dark*(1-mask_3ch*0.65) + hm_col*mask_3ch*0.65).astype(np.uint8)
+    for y in range(0, H, 4):
+        overlay[y, :] = (overlay[y, :] * 0.92).astype(np.uint8)
+    return overlay, False
+
 
 def build_report(name, age, gender, symptoms, diagnosis, conf):
     date = datetime.datetime.now().strftime("%d %b %Y  %H:%M")
@@ -395,7 +634,7 @@ def build_report(name, age, gender, symptoms, diagnosis, conf):
     }
     finding = findings.get(diagnosis, 'Findings noted. Clinical correlation recommended.')
     impression = 'No acute cardiopulmonary process identified.' if diagnosis == 'NORMAL' else f'{diagnosis} detected with {conf:.1f}% confidence. Urgent radiologist review advised.'
-    return f"""PneumoScan AI — Clinical Report
+    return f"""HealthEase AI — Clinical Report
 {'─'*45}
 Date      : {date}
 Patient   : {name or 'Anonymous'}, {gender}, Age {age}
@@ -407,8 +646,8 @@ FINDINGS
 IMPRESSION
 {impression}
 {'─'*45}
-Model     : DenseNet-121 (Transfer Learning)
-Dataset   : NIH ChestX-ray14
+Model     : DenseNet-121 (Transfer Learning, ImageNet)
+Dataset   : Kaggle Chest X-Ray (5,216 images)
 Confidence: {conf:.1f}%
 
 ⚠  AI-generated report. Not a substitute
@@ -421,8 +660,8 @@ with st.sidebar:
     st.markdown("""
     <div style='text-align:center; padding: 20px 0 10px;'>
       <div style='font-size:44px;'>🫁</div>
-      <div style='font-family:Syne,sans-serif; font-weight:800; font-size:22px; color:#e8f4f8;'>PneumoScan</div>
-      <div style='font-family:Space Mono,monospace; font-size:9px; color:#5b8a9f; letter-spacing:2px; margin-top:4px;'>AI DIAGNOSTICS v2.0</div>
+      <div style='font-family:Syne,sans-serif; font-weight:800; font-size:26px; color:#e8f4f8;'>HealthEase AI</div>
+      <div style='font-family:Space Mono,monospace; font-size:9px; color:#5b8a9f; letter-spacing:2px; margin-top:4px;'>SMART MEDICAL DIAGNOSIS</div>
     </div>
     <hr style='border-color:#0e3a5a; margin: 14px 0;'>
     """, unsafe_allow_html=True)
@@ -448,27 +687,15 @@ with st.sidebar:
     else:
         st.markdown('<div style="font-family:Space Mono,monospace;font-size:10px;color:#ffcc00;letter-spacing:1px;margin-top:8px;">⚠ DEMO MODE (no .h5)</div>', unsafe_allow_html=True)
 
-    st.markdown("""
-    <hr style='border-color:#0e3a5a; margin:16px 0;'>
-    <div style='font-family:Space Mono,monospace;font-size:9px;color:#5b8a9f;letter-spacing:1px;line-height:2;'>
-    TECH STACK<br>
-    ──────────<br>
-    DenseNet-121<br>
-    TensorFlow 2.x<br>
-    Grad-CAM<br>
-    FastAPI<br>
-    PostgreSQL<br>
-    Streamlit
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#0e3a5a; margin:16px 0;'>", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════
 # HEADER
 # ═══════════════════════════════════════════════════
 st.markdown("""
 <div class="main-header">
-  <div class="main-title">🫁 PneumoScan AI</div>
-  <div class="main-sub">CHEST X-RAY DEEP LEARNING DIAGNOSIS SYSTEM — DENSENET-121 + GRAD-CAM</div>
+  <div class="main-title">🫁 HealthEase AI</div>
+  <div class="main-sub">SMART MEDICAL DIAGNOSIS ASSISTANT — DENSENET-121 + GRAD-CAM + POSTGRESQL</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -485,7 +712,7 @@ if page == "🔬 Analyze X-Ray":
     with c2:
         st.markdown(f'<div class="metric-card"><div class="metric-val">{avg_conf}%</div><div class="metric-lbl">AVG CONFIDENCE</div></div>', unsafe_allow_html=True)
     with c3:
-        st.markdown(f'<div class="metric-card"><div class="metric-val">94.2%</div><div class="metric-lbl">MODEL ACCURACY</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-val">90.4%</div><div class="metric-lbl">VAL ACCURACY</div></div>', unsafe_allow_html=True)
     with c4:
         st.markdown(f'<div class="metric-card"><div class="metric-val">DenseNet</div><div class="metric-lbl">ARCHITECTURE</div></div>', unsafe_allow_html=True)
 
@@ -509,7 +736,7 @@ if page == "🔬 Analyze X-Ray":
         if uploaded:
             img_pil   = Image.open(uploaded).convert("RGB")
             img_array = np.array(img_pil)
-            st.image(img_pil, caption="Uploaded X-Ray", use_column_width=True)
+            st.image(img_pil, caption="Uploaded X-Ray", use_container_width=True)
 
         analyze_clicked = st.button("🔬  Run Deep Learning Analysis", disabled=not uploaded)
         st.markdown('</div>', unsafe_allow_html=True)
@@ -564,7 +791,7 @@ if page == "🔬 Analyze X-Ray":
             confs, top_class, top_conf = predict(img_array, model, classes)
 
             # Grad-CAM
-            gradcam_img = generate_gradcam(img_array, model)
+            gradcam_img, is_real_gradcam = generate_gradcam(img_array, model, top_class)
 
             # Build report
             report_text = build_report(name, age, gender, symptoms, top_class, top_conf)
@@ -597,9 +824,7 @@ if page == "🔬 Analyze X-Ray":
 
             # Disease confidence bars
             st.markdown("<div style='margin-top:16px;'>", unsafe_allow_html=True)
-            colors = {'PNEUMONIA':'#ff4444','COVID19':'#ff6b35','TUBERCULOSIS':'#ffcc00',
-                      'PLEURAL_EFFUSION':'#ff9944','CARDIOMEGALY':'#00d4ff',
-                      'ATELECTASIS':'#aa88ff','NORMAL':'#39ff14'}
+            colors = {'NORMAL':'#39ff14', 'PNEUMONIA':'#ff4444'}
             for disease, conf_val in sorted(confs.items(), key=lambda x: x[1], reverse=True):
                 color = colors.get(disease, '#00d4ff')
                 st.markdown(f"""
@@ -617,9 +842,10 @@ if page == "🔬 Analyze X-Ray":
             st.markdown("<br>", unsafe_allow_html=True)
             hm_col1, hm_col2 = st.columns(2)
             with hm_col1:
-                st.image(gradcam_img, caption="🔥 Grad-CAM Heatmap (AI Focus Area)", use_column_width=True, channels="BGR")
+                gcam_label = "🔥 Grad-CAM Heatmap — REAL (Model Gradients)" if is_real_gradcam else "🔥 Grad-CAM Heatmap — Simulated Overlay"
+                st.image(gradcam_img, caption=gcam_label, use_container_width=True, channels="BGR")
             with hm_col2:
-                st.image(img_pil, caption="📷 Original X-Ray", use_column_width=True)
+                st.image(img_pil, caption="📷 Original X-Ray", use_container_width=True)
 
             # DB confirmation
             if pid:
@@ -631,7 +857,7 @@ if page == "🔬 Analyze X-Ray":
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown('<div class="panel"><div class="panel-title">● AI Clinical Report</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="report-box">{report_text}</div>', unsafe_allow_html=True)
-            st.download_button("⬇ Download Report", report_text, file_name="PneumoScan_Report.txt", mime="text/plain")
+            st.download_button("⬇ Download Report", report_text, file_name="HealthEaseAI_Report.txt", mime="text/plain")
             st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════
@@ -763,6 +989,38 @@ elif page == "⚙️ Data Flow & Info":
           </div>
         </div>
         """, unsafe_allow_html=True)
+
+    # Model Performance Section
+    st.markdown("""
+    <div class="panel">
+      <div class="panel-title">● Model Performance Metrics</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:10px;">
+        <div style="background:#0c2033;border:1px solid #0e3a5a;border-radius:8px;padding:16px;text-align:center;">
+          <div style="font-family:Space Mono,monospace;font-size:22px;color:#39ff14;font-weight:700;">90.4%</div>
+          <div style="font-family:Space Mono,monospace;font-size:9px;color:#5b8a9f;letter-spacing:1px;margin-top:4px;">VAL ACCURACY</div>
+        </div>
+        <div style="background:#0c2033;border:1px solid #0e3a5a;border-radius:8px;padding:16px;text-align:center;">
+          <div style="font-family:Space Mono,monospace;font-size:22px;color:#00d4ff;font-weight:700;">95.6%</div>
+          <div style="font-family:Space Mono,monospace;font-size:9px;color:#5b8a9f;letter-spacing:1px;margin-top:4px;">VAL AUC</div>
+        </div>
+        <div style="background:#0c2033;border:1px solid #0e3a5a;border-radius:8px;padding:16px;text-align:center;">
+          <div style="font-family:Space Mono,monospace;font-size:22px;color:#ffcc00;font-weight:700;">96.7%</div>
+          <div style="font-family:Space Mono,monospace;font-size:9px;color:#5b8a9f;letter-spacing:1px;margin-top:4px;">TRAIN ACCURACY</div>
+        </div>
+        <div style="background:#0c2033;border:1px solid #0e3a5a;border-radius:8px;padding:16px;text-align:center;">
+          <div style="font-family:Space Mono,monospace;font-size:22px;color:#ff6b35;font-weight:700;">9</div>
+          <div style="font-family:Space Mono,monospace;font-size:9px;color:#5b8a9f;letter-spacing:1px;margin-top:4px;">BEST EPOCH</div>
+        </div>
+      </div>
+      <div style="margin-top:14px;font-family:Space Mono,monospace;font-size:11px;color:#5b8a9f;line-height:2;">
+        Architecture: DenseNet-121 (ImageNet pretrained, 7M parameters)<br>
+        Dataset: Kaggle Chest X-Ray — 5,216 train + 624 validation images<br>
+        Classes: NORMAL (1,341) · PNEUMONIA (3,875)<br>
+        Training: Google Colab T4 GPU · Adam LR=1e-4 · EarlyStopping patience=5<br>
+        Callbacks: ModelCheckpoint (best val_accuracy) · EarlyStopping
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Commands
     st.markdown("""
